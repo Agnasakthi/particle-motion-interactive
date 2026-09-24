@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Particle Motion Lab</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:#07090c;color:#e9edf2;font-family:Inter,system-ui,sans-serif}
+body{min-height:100vh}.wrap{max-width:1250px;margin:auto;padding:24px}
+h1{font-size:24px;margin:0 0 6px}.sub{color:#8d98a6;margin-bottom:18px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:#10141a;border:1px solid #242b35;padding:14px;border-radius:14px}
+input[type=file]{max-width:260px}.btn{border:1px solid #343d49;background:#171c24;color:#fff;padding:10px 14px;border-radius:9px;cursor:pointer}
+.btn:hover{background:#202733}.btn:disabled{opacity:.45;cursor:not-allowed}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;margin-top:14px}
+.stage{position:relative;min-height:620px;border-radius:16px;overflow:hidden;border:1px solid #242b35;background:#030405}
+canvas{width:100%;height:100%;display:block}.hud{position:absolute;left:14px;top:14px;background:#0b0f14cc;border:1px solid #303946;padding:10px 12px;border-radius:10px;font-size:12px;color:#aeb7c3;pointer-events:none}
+.panel{background:#10141a;border:1px solid #242b35;border-radius:16px;padding:16px}.panel h2{font-size:14px;margin:0 0 14px}
+label{display:block;font-size:12px;color:#9ba5b2;margin:13px 0 6px}
+input[type=range]{width:100%}.value{float:right;color:#fff}.status{font-size:12px;color:#9ba5b2;line-height:1.45;margin-top:12px}
+.drop{border:1px dashed #46515f;border-radius:12px;padding:16px;text-align:center;color:#929dab;margin-top:10px}
+@media(max-width:850px){.layout{grid-template-columns:1fr}.stage{min-height:500px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Particle Motion Lab</h1>
+<div class="sub">Upload a particle loop. Optical flow becomes a reusable motion field; the browser turns it into realtime particles.</div>
+
+<div class="toolbar">
+<input id="file" type="file" accept="video/*">
+<button id="analyze" class="btn">Analyze video</button>
+<button id="pause" class="btn" disabled>Pause</button>
+<button id="reset" class="btn" disabled>Reset</button>
+<span id="status">Waiting for video…</span>
+</div>
+
+<div class="layout">
+<div class="stage" id="stage">
+<canvas id="canvas"></canvas>
+<div class="hud" id="hud">Mouse: —<br>Mode: Stir</div>
+</div>
+<div class="panel">
+<h2>Interaction</h2>
+<label>Mouse force <span class="value" id="forceV">1.0</span></label>
+<input id="force" type="range" min="0" max="3" value="1" step=".05">
+<label>Particle count <span class="value" id="countV">30000</span></label>
+<input id="count" type="range" min="5000" max="50000" value="30000" step="1000">
+<label>Motion influence <span class="value" id="motionV">1.0</span></label>
+<input id="motion" type="range" min="0" max="2" value="1" step=".05">
+<label>Drag <span class="value" id="dragV">0.92</span></label>
+<input id="drag" type="range" min=".80" max=".99" value=".92" step=".005">
+<label>Mouse mode</label>
+<select id="mode" class="btn" style="width:100%">
+<option value="stir">Stir</option><option value="attract">Attract</option><option value="repel">Repel</option>
+</select>
+<div class="drop">Move the mouse through the field. The analyzed motion continuously advects the particles, while the mouse adds a local force.</div>
+<div class="status" id="detail">No analysis yet.</div>
+</div>
+</div>
+</div>
+
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const canvas=$("canvas"), stage=$("stage");
+let engine, scene, mesh, positions, velocities, count=30000;
+let flow=null, fw=0, fh=0, ff=0, paused=false, time=0;
+let mouse={x:.5,y:.5,inside:false};
+let params={force:1,motion:1,drag:.92,mode:"stir"};
+
+function status(t){$("status").textContent=t}
+function b64ToFloat16(b64){
+  const bin=atob(b64), bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  const dv=new DataView(bytes.buffer), out=new Float32Array(bytes.byteLength/2);
+  for(let i=0;i<out.length;i++) out[i]=float16ToFloat32(dv.getUint16(i*2,true));
+  return out;
+}
+function float16ToFloat32(h){
+  const s=(h&0x8000)?-1:1,e=(h>>10)&31,f=h&1023;
+  if(e===0)return s*Math.pow(2,-14)*(f/1024);
+  if(e===31)return f?NaN:s*Infinity;
+  return s*Math.pow(2,e-15)*(1+f/1024);
+}
+function flowAt(x,y,frame){
+  const gx=Math.max(0,Math.min(fw-1,Math.floor(x*fw)));
+  const gy=Math.max(0,Math.min(fh-1,Math.floor(y*fh)));
+  const i=(frame*fw*fh+(gy*fw+gx))*2;
+  return [flow[i]||0,flow[i+1]||0];
+}
+function init(){
+  engine=new BABYLON.Engine(canvas,true,{preserveDrawingBuffer:false,stencil:false});
+  scene=new BABYLON.Scene(engine);
+  scene.clearColor=new BABYLON.Color4(.012,.014,.018,1);
+  const camera=new BABYLON.FreeCamera("camera",new BABYLON.Vector3(0,0,10),scene);
+  camera.mode=BABYLON.Camera.ORTHOGRAPHIC_CAMERA;
+  const resize=()=>{const a=canvas.clientWidth/Math.max(1,canvas.clientHeight);camera.orthoLeft=-a;camera.orthoRight=a;camera.orthoTop=1;camera.orthoBottom=-1;engine.resize()};
+  window.addEventListener("resize",resize); resize();
+  createParticles();
+  engine.runRenderLoop(update);
+}
+function createParticles(){
+  if(mesh)mesh.dispose();
+  count=+($("count").value);
+  positions=new Float32Array(count*3); velocities=new Float32Array(count*3);
+  for(let i=0;i<count;i++){
+    const a=Math.random()*Math.PI*2,r=Math.pow(Math.random(),.55)*.98;
+    positions[i*3]=Math.cos(a)*r*(.9+.1*Math.random());
+    positions[i*3+1]=Math.sin(a)*r;
+    positions[i*3+2]=0;
+  }
+  const vd=new BABYLON.VertexData();
+  vd.positions=Array.from(positions);
+  const indices=new Array(count);for(let i=0;i<count;i++)indices[i]=i;
+  vd.indices=indices;
+  mesh=new BABYLON.Mesh("particles",scene);vd.applyToMesh(mesh,true);
+  mesh.alwaysSelectAsActiveMesh=true;
+  const mat=new BABYLON.StandardMaterial("particleMat",scene);
+  mat.pointsCloud=true;mat.pointSize=2.2;mat.emissiveColor=new BABYLON.Color3(.75,.88,1);
+  mesh.material=mat;
+}
+function update(){
+  if(!positions)return;
+  if(!paused){
+    time+=engine.getDeltaTime()/1000;
+    const frame=flow?Math.floor((time*(flow.length/(fw*fh*2))*6))%(flow.length/(fw*fh*2)):0;
+    const totalFrames=flow?ff:1, f=Math.floor(time*6)%totalFrames;
+    const mx=(mouse.x*2-1), my=(1-mouse.y)*2-1;
+    const radius=.32, force=params.force*.0018;
+    for(let i=0;i<count;i++){
+      const p=i*3,x=positions[p],y=positions[p+1];
+      let vx=velocities[p],vy=velocities[p+1];
+      if(flow){
+        const nx=(x+1)/2,ny=(1-y)/2,[fx,fy]=flowAt(nx,ny,f);
+        vx+=fx*.012*params.motion;vy+=-fy*.012*params.motion;
+      }
+      const dx=mx-x,dy=my-y,d2=dx*dx+dy*dy;
+      if(d2<radius*radius){
+        const d=Math.sqrt(d2)+.0001, fall=1-d/radius;
+        if(params.mode==="attract"){vx+=dx/d*force*fall;vy+=dy/d*force*fall}
+        else if(params.mode==="repel"){vx-=dx/d*force*fall;vy-=dy/d*force*fall}
+        else {vx+=(-dy)*force*fall;vy+=dx*force*fall}
+      }
+      vx*=params.drag;vy*=params.drag;
+      positions[p]+=vx;positions[p+1]+=vy;
+      if(positions[p]<-1.08)positions[p]=1.08;if(positions[p]>1.08)positions[p]=-1.08;
+      if(positions[p+1]<-1.08)positions[p+1]=1.08;if(positions[p+1]>1.08)positions[p+1]=-1.08;
+      velocities[p]=vx;velocities[p+1]=vy;
+    }
+    const pos=mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+    pos.set(positions);mesh.updateVerticesData(BABYLON.VertexBuffer.PositionKind,pos,false,false);
+  }
+  $("hud").innerHTML=`Mouse: ${mouse.inside?Math.round(mouse.x*100)+"%, "+Math.round(mouse.y*100)+"%":"—"}<br>Mode: ${params.mode}`;
+  scene.render();
+}
+stage.addEventListener("pointermove",e=>{const r=canvas.getBoundingClientRect();mouse.x=(e.clientX-r.left)/r.width;mouse.y=(e.clientY-r.top)/r.height;mouse.inside=true});
+stage.addEventListener("pointerleave",()=>mouse.inside=false);
+$("force").oninput=e=>{params.force=+e.target.value;$("forceV").textContent=params.force.toFixed(2)};
+$("motion").oninput=e=>{params.motion=+e.target.value;$("motionV").textContent=params.motion.toFixed(2)};
+$("drag").oninput=e=>{params.drag=+e.target.value;$("dragV").textContent=params.drag.toFixed(3)};
+$("mode").onchange=e=>params.mode=e.target.value;
+$("count").onchange=()=>{createParticles();$("countV").textContent=$("count").value};
+$("pause").onclick=()=>{paused=!paused;$("pause").textContent=paused?"Resume":"Pause"};
+$("reset").onclick=()=>{createParticles();time=0};
+
+$("analyze").onclick=async()=>{
+ const f=$("file").files[0];if(!f){status("Choose a video first.");return}
+ $("analyze").disabled=true;status("Uploading + extracting optical flow…");
+ try{
+   const fd=new FormData();fd.append("file",f);
+   const r=await fetch("/analyze",{method:"POST",body:fd});
+   if(!r.ok)throw new Error(await r.text());
+   const info=await r.json();status("Loading motion field…");
+   const a=await (await fetch("/analysis/"+info.id)).json();
+   fw=a.width;fh=a.height;ff=a.frames;flow=b64ToFloat16(a.flow);
+   $("detail").textContent=`Analyzed ${ff} motion fields at ${fw}×${fh}. Mouse interaction is now live.`;
+   $("pause").disabled=false;$("reset").disabled=false;status("Ready — move your mouse through the particles.");
+ }catch(e){console.error(e);status("Analysis failed: "+e.message)}
+ finally{$("analyze").disabled=false}
+};
+init();
+</script>
+</body>
+</html>
